@@ -1,0 +1,73 @@
+# topology.yaml — Containerlab multi-node SONiC topology
+#
+# Topology:
+#
+#   exabgp1 (AS 65100)
+#       │ eth1
+#       │ 192.168.10.0/30
+#       │ eth1
+#   sonic1 (AS 65001)  ────────────────── sonic2 (AS 65002)
+#      eth0 (mgmt)        eth2 ─── eth2      eth0 (mgmt)
+#                       10.0.0.0/30
+#
+# ExaBGP advertises test prefixes (10.100.0.0/24, 10.101.0.0/24, etc.)
+# to sonic1. sonic1 redistributes them to sonic2 via iBGP (or eBGP).
+#
+# Management network: 172.20.20.0/24 (containerlab default)
+#   sonic1:  172.20.20.2
+#   sonic2:  172.20.20.3
+#   exabgp1: 172.20.20.4
+#
+# Usage:
+#   containerlab deploy -t infra/topology.yaml
+#   containerlab destroy -t infra/topology.yaml
+#
+# Requirements:
+#   - containerlab >= 0.54
+#   - Docker images pulled:
+#       docker pull ghcr.io/sonic-net/sonic-vs:latest
+#       docker pull pierky/exabgp:latest
+
+name: sonic-route-checker
+
+mgmt:
+  network: sonic-mgmt
+  ipv4-subnet: 172.20.20.0/24
+
+topology:
+  nodes:
+    sonic1:
+      kind: sonic-vs
+      image: ghcr.io/sonic-net/sonic-vs:latest
+      mgmt-ipv4: 172.20.20.2
+      env:
+        SONIC_MGMT_INTERFACE: eth0
+      binds:
+        # Mount a minimal config_db.json to set hostname and BGP ASN
+        - infra/config/sonic1_config_db.json:/etc/sonic/config_db.json:ro
+
+    sonic2:
+      kind: sonic-vs
+      image: ghcr.io/sonic-net/sonic-vs:latest
+      mgmt-ipv4: 172.20.20.3
+      env:
+        SONIC_MGMT_INTERFACE: eth0
+      binds:
+        - infra/config/sonic2_config_db.json:/etc/sonic/config_db.json:ro
+
+    exabgp1:
+      kind: linux
+      image: pierky/exabgp:latest
+      mgmt-ipv4: 172.20.20.4
+      binds:
+        # ExaBGP config and route injection scripts
+        - infra/exabgp.conf:/etc/exabgp/exabgp.conf:ro
+        - infra/routes.py:/etc/exabgp/routes.py:ro
+      cmd: exabgp /etc/exabgp/exabgp.conf
+
+  links:
+    # sonic1 ↔ exabgp1  (eBGP peering: AS 65001 ↔ AS 65100)
+    - endpoints: ["sonic1:eth1", "exabgp1:eth1"]
+
+    # sonic1 ↔ sonic2  (inter-switch link)
+    - endpoints: ["sonic1:eth2", "sonic2:eth2"]
