@@ -81,10 +81,20 @@ FRR (zebra) ──► netlink ──► Kernel FIB   (parallel path)
 The agent uses LangGraph `stream_mode="messages"` throughout. This is a **single-phase**
 design:
 
-1. LangGraph ReAct loop runs with `recursion_limit=25`, calling tools and streaming
-   `AIMessageChunk` objects as they arrive.
-2. Tool names are extracted from chunks where `tool_call_chunks` is non-empty.
-3. Final answer text is extracted from chunks where `tool_call_chunks` is empty and
+1. On first use, `build_agent()` spawns `agent/mcp_server.py` as a subprocess via
+   `MultiServerMCPClient` (stdio transport) and loads all 12 tools as LangChain
+   `BaseTool` objects. The subprocess is alive only for the duration of the tool-loading
+   call; tools returned are plain objects that manage their own subprocess communication.
+2. LangGraph ReAct loop runs with `recursion_limit=25`. All graph execution uses the
+   **async** path (`agent.ainvoke` / `agent.astream`) because MCP tools are async-only.
+   The `call_model` node is `async def` and uses `llm_with_tools.ainvoke()`.
+3. The public API remains synchronous. `run_agent_query` and the non-stream `run_rca`
+   bridge via `asyncio.run(agent.ainvoke(...))`. The streaming functions
+   (`stream_agent_response`, `run_rca(stream=True)`) bridge via a daemon thread running
+   `asyncio.run(agent.astream(...))` that feeds a `queue.Queue`; the sync generator
+   drains the queue and yields events, preserving real-time token delivery to Streamlit.
+4. Tool names are extracted from chunks where `tool_call_chunks` is non-empty.
+5. Final answer text is extracted from chunks where `tool_call_chunks` is empty and
    `content` is a list of `{"type": "text", "text": "..."}` blocks.
 
 **Critical implementation detail**: LangChain-Anthropic with `stream_mode="messages"`
@@ -256,13 +266,17 @@ noise-suppressed; entries with `vrf="default"` are treated as real inconsistenci
 
 ## 8. Agent
 
-### Tools (`agent/tools.py`)
+### Tools (`agent/mcp_server.py`)
 
-12 tools registered. All run on the HOST (not container) — API calls go to
-`http://127.0.0.1:8000` which is port-mapped from the container. Subprocess tools
-(`get_daemon_status`, `get_orchagent_logs`, etc.) run locally on the host, not via
-`docker exec`. `supervisorctl` is not available on the host — those tools return
-`"supervisorctl not available"`.
+12 tools exposed as an MCP server over stdio transport. All run on the HOST (not
+container) — API calls go to `http://127.0.0.1:8000` which is port-mapped from the
+container. Subprocess tools (`get_daemon_status`, `get_orchagent_logs`, etc.) run
+locally on the host, not via `docker exec`. `supervisorctl` is not available on the
+host — those tools return `"supervisorctl not available"`.
+
+`agent/tools.py` still exists but its `@tool`-decorated functions and `TOOLS` list are
+**dead code** (commented out) since MCP adoption. The private helpers `_api_get`,
+`_api_post`, `_run_local` remain active — they are imported by `mcp_server.py`.
 
 | Tool | Description |
 |---|---|
@@ -282,7 +296,11 @@ noise-suppressed; entries with `vrf="default"` are treated as real inconsistenci
 ### Agent Configuration
 
 - **Model**: `claude-sonnet-4-6` via `langchain_anthropic.ChatAnthropic`
-- **recursion_limit**: 25 — passed in config at every `.stream()` and `.invoke()` call.
+- **Tools**: loaded from `agent/mcp_server.py` at agent startup via
+  `MultiServerMCPClient` (stdio transport). `asyncio.run(_load_mcp_tools())` is called
+  once inside `build_agent()` — safe because all callers are synchronous (Streamlit main
+  thread, CLI). Calling from an async context would raise `RuntimeError`.
+- **recursion_limit**: 25 — passed in config at every `.ainvoke()` and `.astream()` call.
   This was 10 originally but 10 was too low: with 5+ tool calls, the graph hit the limit
   before the model could write a final answer, producing empty responses.
 - **Graph**: `StateGraph(AgentState)` with `agent` and `tools` nodes; conditional edge
@@ -363,6 +381,10 @@ ANTHROPIC_API_KEY=sk-ant-... .venv/bin/streamlit run dashboard/app.py \
   chat panel is unaffected.
 - Raw mode toggle: calls `/inconsistencies?raw=true` to include suppressed noise.
 - Manual refresh button forces `last_fetch_ts = 0` to bypass the 30s API cache.
+- Countdown timer (`Next refresh in Xs`) rendered via `st.components.v1.html` with a
+  self-looping JS `setInterval`. The JS resets to `REFRESH_INTERVAL_S` when it reaches 0
+  rather than stopping, because Streamlit reuses the component iframe across fragment
+  re-runs and does not re-execute the script on each re-run.
 - No `time.sleep()` or `st.rerun()` anywhere — those caused full-page reruns that
   re-triggered agent calls.
 
@@ -469,8 +491,8 @@ pip3 download fastapi uvicorn redis pyroute2 \
   -d /tmp/sonic-wheels \
   --python-version 3.11 --platform manylinux_2_17_x86_64 --only-binary=:all:
 
-# Agent deps (langgraph, langchain-anthropic, etc.):
-pip3 download langgraph langchain-anthropic langchain-core \
+# Agent deps (langgraph, langchain-anthropic, mcp, etc.):
+pip3 download langgraph langchain-anthropic langchain-core mcp langchain-mcp-adapters \
   -d /tmp/agent-wheels \
   --python-version 3.11 --platform manylinux_2_17_x86_64 --only-binary=:all:
 
@@ -486,7 +508,7 @@ docker exec sonic-vs pip3 install --no-index \
 
 docker exec sonic-vs pip3 install --no-index \
   --find-links /tmp/agent-wheels \
-  langgraph langchain-anthropic langchain-core
+  langgraph langchain-anthropic langchain-core mcp langchain-mcp-adapters
 
 # Allow inbound from Docker bridge gateway
 docker exec sonic-vs iptables -I INPUT 1 -s 172.17.0.1 -p tcp --dport 8000 -j ACCEPT
@@ -535,6 +557,10 @@ pip3 download "rpds-py>=0.25.0" jiter orjson \
 | `stale_asic` scenario was noise-suppressed | Fixed by omitting `"vr"` from ASIC_DB key — vrf resolves to "default" instead of an OID, bypassing the SAI-internal filter. |
 | Full-page reruns during auto-refresh triggered agent twice | Fixed with `@st.fragment(run_every=10)` on the left panel (isolates refresh) and `last_processed_query` guard on the chat input. |
 | `supervisorctl` not available on host | `get_daemon_status` and log tools return "not available" when run from the host. Only useful when agent runs inside the container. For demo: daemon status is still informative for the base container daemons shown by `supervisorctl status` output cached from prior runs. |
+| MCP tool loading adds ~0.5–1.5s to first agent call | `build_agent()` spawns `mcp_server.py` subprocess and performs MCP handshake on first `get_agent()` call. Subsequent calls use the singleton — no extra cost. |
+| `asyncio.run()` not reentrant | `_load_mcp_tools()` is called via `asyncio.run()` inside `build_agent()`. Safe for all current callers (Streamlit main thread, CLI). Would raise `RuntimeError` if called from within an already-running event loop. |
+| `StructuredTool does not support sync invocation` | MCP tools from `langchain-mcp-adapters` are async-only. Fixed by switching all graph execution to the async path: `call_model` is now `async def` using `ainvoke`; `run_agent_query` and non-stream `run_rca` use `asyncio.run(agent.ainvoke(...))`; streaming functions run `agent.astream()` in a daemon thread and feed a `queue.Queue` to preserve sync generator semantics. |
+| `.env` not loaded automatically | Dashboard reads `ANTHROPIC_API_KEY` from the environment. Added `_load_dotenv()` in `dashboard/app.py` that parses the project-root `.env` file as a fallback if the env var is not already set. No new dependency — pure stdlib. |
 
 ---
 
@@ -552,11 +578,17 @@ sonic-route-checker/
 ├── agent/
 │   ├── __init__.py
 │   ├── agent.py            LangGraph StateGraph, run_agent_query,
-│   │                       stream_agent_response, run_rca, CLI
-│   ├── tools.py            12 LangChain @tool wrappers
+│   │                       stream_agent_response, run_rca, CLI;
+│   │                       loads tools from mcp_server.py via MultiServerMCPClient
+│   ├── mcp_server.py       FastMCP server — 12 tools over stdio transport;
+│   │                       reuses _api_get/_api_post/_run_local from tools.py
+│   ├── tools.py            private helpers (_api_get, _api_post, _run_local) —
+│   │                       active, imported by mcp_server.py; @tool functions
+│   │                       and TOOLS list are dead code (commented out)
 │   └── prompts.py          SYSTEM_PROMPT — SONiC domain context for Claude
 ├── dashboard/
-│   └── app.py              Streamlit UI, st.fragment auto-refresh, streaming chat
+│   └── app.py              Streamlit UI, st.fragment auto-refresh, streaming chat;
+│                           reads ANTHROPIC_API_KEY from .env if not in environment
 ├── tests/
 │   └── fault_inject.py     4 fault scenarios via docker exec
 ├── .venv/                  Python 3.12 venv on host (langgraph, streamlit, etc.)

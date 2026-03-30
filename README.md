@@ -1,6 +1,6 @@
 # SONiC Route Consistency Checker + AI Agent
 
-**Built entirely with Claude Code** &nbsp;|&nbsp; Python &nbsp;|&nbsp; SONiC &nbsp;|&nbsp; LangGraph &nbsp;|&nbsp; Streamlit
+**Built entirely with Claude Code** &nbsp;|&nbsp; Python &nbsp;|&nbsp; SONiC &nbsp;|&nbsp; LangGraph &nbsp;|&nbsp; MCP &nbsp;|&nbsp; Streamlit
 
 ---
 
@@ -17,7 +17,8 @@ Cross-plane route inconsistencies in SONiC are invisible until traffic breaks. A
 
 - Real-time consistency checking across all four SONiC routing planes
 - Noise filtering: SAI-internal OID entries, management-plane routes, loopback prefixes, IPv6 link-local ghosts
-- AI agent with 12 diagnostic tools that autonomously traces root cause from symptom to fix
+- AI agent with 12 diagnostic tools exposed as an **MCP server** (`agent/mcp_server.py`) — usable by Claude Desktop, Claude Code, or any MCP-compatible client, not just this project's agent
+- LangGraph ReAct agent loads tools at runtime from the MCP server via `MultiServerMCPClient` (stdio transport)
 - Fault injection suite covering fpmsyncd gaps, SAI programming failures, stale ASIC entries, and nexthop mismatches
 - Streamlit dashboard with streaming token output — first answer tokens appear within 2–3 seconds of tool calls completing
 
@@ -59,7 +60,7 @@ Each handoff is a failure point. `FRR present, APP_DB absent` means fpmsyncd isn
 git clone <repo>
 cd sonic-route-checker
 python3 -m venv .venv && source .venv/bin/activate
-pip install streamlit langgraph langchain-anthropic langchain-core httpx requests
+pip install streamlit langgraph langchain-anthropic langchain-core mcp langchain-mcp-adapters httpx requests
 ```
 
 **Run**
@@ -114,8 +115,11 @@ sonic-route-checker/
 │   ├── diff_engine.py      Cross-plane diff, severity classification, noise suppression
 │   └── api.py              FastAPI server — 5 endpoints, 30s snapshot cache
 ├── agent/
-│   ├── agent.py            LangGraph ReAct graph, streaming API, CLI entry point
-│   ├── tools.py            12 diagnostic tools (API calls + subprocess)
+│   ├── agent.py            LangGraph ReAct graph, streaming API, CLI entry point;
+│   │                       loads tools from mcp_server.py via MultiServerMCPClient
+│   ├── mcp_server.py       FastMCP server — 12 tools over stdio, any MCP client can use
+│   ├── tools.py            private HTTP/subprocess helpers (active); @tool functions
+│   │                       and TOOLS list are dead code after MCP adoption
 │   └── prompts.py          SONiC domain system prompt for Claude
 ├── dashboard/
 │   └── app.py              Streamlit UI — live table (st.fragment) + streaming chat
@@ -136,16 +140,20 @@ This project was built entirely using [Claude Code](https://claude.ai/code). The
 
 Notable AI-assisted debugging moments:
 
+- **MCP adoption**: Migrated from LangChain `@tool` decorators to a FastMCP server (`agent/mcp_server.py`). Tools are now loaded at runtime via `MultiServerMCPClient` (stdio transport), making them reusable by any MCP client. The LangGraph graph, streaming logic, and all public API signatures are unchanged — only `build_agent()` was modified.
+- **MCP async-only tools**: `langchain-mcp-adapters` returns async-only `StructuredTool` objects — calling them synchronously raises `StructuredTool does not support sync invocation`. Fixed by switching all graph execution to the async path (`ainvoke`/`astream`). Streaming functions bridge back to sync via a daemon thread + `queue.Queue`, preserving real-time token delivery to Streamlit.
+- **`.env` fallback for API key**: Dashboard now calls `_load_dotenv()` at startup to read `ANTHROPIC_API_KEY` from the project-root `.env` file if the environment variable is not already set. No new dependency.
 - **docker0 NO-CARRIER / nftables**: Docker on Ubuntu 24.04 routes through nftables, not iptables. Host-level `iptables` rules have no effect; container `iptables INPUT` rules are required instead.
 - **`"vr"` vs `"vr_id"` in ASIC\_DB keys**: SONiC-VS uses `"vr"` as the VRF field in ASIC\_DB route entry JSON. Standard docs reference `"vr_id"`. The collector handles both.
 - **LangGraph streaming content format**: `AIMessageChunk.content` from LangChain-Anthropic is always a `list[dict]` (`[{"type": "text", "text": "..."}]`), never a plain string. `isinstance(content, str)` silently drops every token.
-- **`recursion_limit` placement**: `graph.compile(recursion_limit=N)` raises `TypeError`. It must be passed at runtime: `config={"recursion_limit": 25}` in every `.stream()` and `.invoke()` call.
+- **`recursion_limit` placement**: `graph.compile(recursion_limit=N)` raises `TypeError`. It must be passed at runtime: `config={"recursion_limit": 25}` in every `.ainvoke()` and `.astream()` call.
 - **Noise suppression rules**: Derived from live observation of SONiC-VS false positives — SAI OID VRF entries, Docker bridge routes, IPv6 link-local ghost entries written by fpmsyncd.
 
 ---
 
 ## Technical Notes
 
+- **MCP server is standalone**: `python -m agent.mcp_server` runs as a stdio MCP server. Any MCP-compatible client can connect to it directly — you don't need the LangGraph agent to use the tools.
 - **Streamlit runs on the host** (port 8502), not inside the container. The container has no outbound internet access, so Anthropic API calls fail from inside.
 - **Ollama tested and rejected**: `qwen2.5-coder:7b` on an i7-10610U / 16 GB took 4m36s per response and hallucinated Redis key formats and DB IDs. `claude-sonnet-4-6` via the Anthropic API is the only model used.
 - **Full SONiC-VS quirks**: ASIC\_DB key format, fpmsyncd management-plane filtering, bgpd starting STOPPED, static Null0 routes for test traffic — all documented in `CLAUDE.md`.

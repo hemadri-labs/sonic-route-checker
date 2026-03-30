@@ -6,7 +6,8 @@ Layout:
   Right (40%): Claude AI agent chat
 
 Environment variables:
-    ANTHROPIC_API_KEY   Required for the right-panel chat
+    ANTHROPIC_API_KEY   Required for the right-panel chat. If not set, the dashboard
+                        falls back to reading it from a .env file in the project root.
     CHECKER_API_URL     Base URL of the FastAPI server (default: http://127.0.0.1:8000)
 
 Run:
@@ -20,10 +21,31 @@ from typing import Optional
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+# Load .env from the project root if ANTHROPIC_API_KEY is not already in the environment.
+def _load_dotenv() -> None:
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
 
 API_BASE = os.environ.get("CHECKER_API_URL", "http://127.0.0.1:8000")
 REFRESH_INTERVAL_S = 10
@@ -157,9 +179,32 @@ def inconsistency_panel() -> None:
     with ctrl_left:
         raw_mode = st.toggle("Raw mode (include suppressed noise)", value=False)
     with ctrl_mid:
-        auto_refresh = st.toggle("Auto-refresh (10 s)", value=True)
+        auto_refresh = st.toggle("Auto-refresh", value=True)
     with ctrl_right:
         manual_refresh = st.button("Refresh now")
+
+    if auto_refresh:
+        components.html(
+            f"""
+            <div style="font-size:0.78em; color:#888; font-family:sans-serif; padding:1px 0 4px 0">
+              Next refresh in
+              <span id="cd" style="font-weight:bold; color:#4b9eff">{REFRESH_INTERVAL_S}</span>s
+            </div>
+            <script>
+              (function() {{
+                var total = {REFRESH_INTERVAL_S};
+                var n = total;
+                var el = document.getElementById('cd');
+                setInterval(function() {{
+                  n--;
+                  if (n <= 0) {{ n = total; }}
+                  if (el) el.textContent = n;
+                }}, 1000);
+              }})();
+            </script>
+            """,
+            height=22,
+        )
 
     if manual_refresh:
         st.session_state.last_fetch_ts = 0.0

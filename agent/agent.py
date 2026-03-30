@@ -19,20 +19,24 @@ Environment variables:
     CHECKER_API_URL     Checker FastAPI base URL (default: http://127.0.0.1:8000)
 """
 
+import asyncio
 import os
+import queue as _queue
+import sys
+import threading
 from typing import Literal
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import (
     HumanMessage, AIMessage, AIMessageChunk, BaseMessage, SystemMessage,
 )
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict, Annotated
 
 from .prompts import SYSTEM_PROMPT
-from .tools import TOOLS
 
 
 # ---------------------------------------------------------------------------
@@ -44,19 +48,53 @@ class AgentState(TypedDict):
 
 
 # ---------------------------------------------------------------------------
+# MCP tool loader
+# ---------------------------------------------------------------------------
+
+async def _load_mcp_tools() -> list:
+    """
+    Spawn the MCP server subprocess and load its tools as LangChain BaseTool objects.
+
+    NOTE: Must be called from a synchronous context via asyncio.run(). Calling
+    from within an already-running event loop will raise RuntimeError.
+    """
+    client = MultiServerMCPClient(
+        {
+            "sonic-route-checker": {
+                "command": sys.executable,
+                "args": ["-m", "agent.mcp_server"],
+                "transport": "stdio",
+                "env": {
+                    "CHECKER_API_URL": os.environ.get(
+                        "CHECKER_API_URL", "http://127.0.0.1:8000"
+                    ),
+                    "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
+                },
+            }
+        }
+    )
+    return await client.get_tools()
+
+
+# ---------------------------------------------------------------------------
 # Build the graph
 # ---------------------------------------------------------------------------
 
 def build_agent():
     """Construct and compile the LangGraph ReAct agent."""
+    # Load tools from the MCP server subprocess. asyncio.run() is safe here
+    # because build_agent() is always called from a synchronous context
+    # (Streamlit main thread or CLI __main__).
+    mcp_tools = asyncio.run(_load_mcp_tools())
+
     llm = ChatAnthropic(
         model="claude-sonnet-4-6",
         temperature=0,
         max_tokens=4096,
     )
-    llm_with_tools = llm.bind_tools(TOOLS)
+    llm_with_tools = llm.bind_tools(mcp_tools)
 
-    def call_model(state: AgentState) -> AgentState:
+    async def call_model(state: AgentState) -> AgentState:
         """Invoke the LLM with the current message history."""
         messages = state["messages"]
 
@@ -64,7 +102,7 @@ def build_agent():
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
 
-        response = llm_with_tools.invoke(messages)
+        response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
 
     def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
@@ -74,7 +112,7 @@ def build_agent():
             return "tools"
         return "__end__"
 
-    tool_node = ToolNode(tools=TOOLS)
+    tool_node = ToolNode(tools=mcp_tools)
 
     graph = StateGraph(AgentState)
     graph.add_node("agent", call_model)
@@ -123,18 +161,31 @@ def run_rca(query: str, stream: bool = False):
     _cfg = {"recursion_limit": 25}
 
     if stream:
-        def _stream():
-            for event in agent.stream(initial_state, config=_cfg, stream_mode="values"):
+        # Bridge async astream to a sync generator via thread + queue.
+        q: _queue.Queue = _queue.Queue()
+
+        async def _run_stream():
+            async for event in agent.astream(initial_state, config=_cfg, stream_mode="values"):
                 last = event["messages"][-1]
                 if isinstance(last, AIMessage):
                     if last.tool_calls:
                         for tc in last.tool_calls:
-                            yield ("tool_call", tc["name"])
+                            q.put(("tool_call", tc["name"]))
                     elif last.content:
-                        yield ("response", last.content)
+                        q.put(("response", last.content))
+            q.put(None)  # sentinel
+
+        threading.Thread(target=lambda: asyncio.run(_run_stream()), daemon=True).start()
+
+        def _stream():
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                yield item
         return _stream()
     else:
-        final_state = agent.invoke(initial_state, config=_cfg)
+        final_state = asyncio.run(agent.ainvoke(initial_state, config=_cfg))
         last = final_state["messages"][-1]
         return last.content if isinstance(last, AIMessage) else str(last)
 
@@ -173,7 +224,7 @@ def run_agent_query(query: str, conversation_history: list | None = None) -> dic
     lc_messages.append(HumanMessage(content=query))
 
     initial_state = {"messages": lc_messages}
-    final_state = agent.invoke(initial_state, config={"recursion_limit": 25})
+    final_state = asyncio.run(agent.ainvoke(initial_state, config={"recursion_limit": 25}))
 
     # Collect tool calls and build output message list
     tool_calls_made: list[str] = []
@@ -230,38 +281,51 @@ def stream_agent_response(
     initial_state = {"messages": lc_messages}
     seen_tools: set[str] = set()
 
-    for chunk, _metadata in agent.stream(
-        initial_state, config={"recursion_limit": 25}, stream_mode="messages"
-    ):
-        if not isinstance(chunk, AIMessageChunk):
-            continue
-        # Report each newly-named tool call once as it starts streaming in
-        for tc_chunk in (chunk.tool_call_chunks or []):
-            name = tc_chunk.get("name") or ""
-            if name and name not in seen_tools:
-                seen_tools.add(name)
-                yield ("tool_call", name)
+    # MCP tools are async-only; bridge agent.astream to a sync generator
+    # via thread + queue so Streamlit (sync) can consume tokens as they arrive.
+    q: _queue.Queue = _queue.Queue()
 
-        # Extract text — content is always a list of blocks from Claude,
-        # e.g. [{'type': 'text', 'text': 'hello', 'index': 0}].
-        # Skip chunks that are still building tool calls (tcc > 0) or are
-        # ToolMessages (have tool_call_id).
-        if chunk.tool_call_chunks or getattr(chunk, "tool_call_id", None):
-            continue
+    async def _run():
+        async for chunk, _metadata in agent.astream(
+            initial_state, config={"recursion_limit": 25}, stream_mode="messages"
+        ):
+            if not isinstance(chunk, AIMessageChunk):
+                continue
+            # Report each newly-named tool call once as it starts streaming in
+            for tc_chunk in (chunk.tool_call_chunks or []):
+                name = tc_chunk.get("name") or ""
+                if name and name not in seen_tools:
+                    seen_tools.add(name)
+                    q.put(("tool_call", name))
 
-        if isinstance(chunk.content, str):
-            text = chunk.content
-        elif isinstance(chunk.content, list):
-            text = "".join(
-                block.get("text", "")
-                for block in chunk.content
-                if isinstance(block, dict) and block.get("type") == "text"
-            )
-        else:
-            text = ""
+            # Extract text — content is always a list of blocks from Claude,
+            # e.g. [{'type': 'text', 'text': 'hello', 'index': 0}].
+            # Skip chunks that are still building tool calls or are ToolMessages.
+            if chunk.tool_call_chunks or getattr(chunk, "tool_call_id", None):
+                continue
 
-        if text:
-            yield ("token", text)
+            if isinstance(chunk.content, str):
+                text = chunk.content
+            elif isinstance(chunk.content, list):
+                text = "".join(
+                    block.get("text", "")
+                    for block in chunk.content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            else:
+                text = ""
+
+            if text:
+                q.put(("token", text))
+        q.put(None)  # sentinel
+
+    threading.Thread(target=lambda: asyncio.run(_run()), daemon=True).start()
+
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        yield item
 
 
 # ---------------------------------------------------------------------------
